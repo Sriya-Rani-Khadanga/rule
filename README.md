@@ -1,1 +1,3 @@
-# campus_event_conflict_resolver
+# Welcome to your Lovable project
+
+TODO: Document your project here
