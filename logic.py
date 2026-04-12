@@ -8,14 +8,42 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
 VENUES = ["Auditorium", "Seminar Hall", "Open Ground", "Lab Block A", "Cafeteria Court"]
-TIME_SLOTS = ["morning", "afternoon", "evening"]
+
+MIN_EVENT_DURATION = 15
+MAX_EVENT_DURATION = 720  # minutes; must fit typical same-day campus use
+
+
+def format_event_schedule(start: time, duration_minutes: int) -> str:
+    """Clock span for UI and conflict descriptions (same calendar day display)."""
+    s0 = datetime(2000, 1, 1, start.hour, start.minute, start.second)
+    e0 = s0 + timedelta(minutes=int(duration_minutes))
+    return f"{start.strftime('%H:%M')}-{e0.strftime('%H:%M')} ({int(duration_minutes)} min)"
+
+
+def _event_window(ev: "EventRequest") -> tuple[datetime, datetime]:
+    start = datetime.combine(ev.preferred_date, ev.preferred_start)
+    end = start + timedelta(minutes=int(ev.duration_minutes))
+    return start, end
+
+
+def intervals_overlap_on_calendar(a: "EventRequest", b: "EventRequest") -> bool:
+    """True if the two events' [start, end) intervals intersect in absolute time."""
+    sa, ea = _event_window(a)
+    sb, eb = _event_window(b)
+    return sa < eb and sb < ea
+
+
+def _bump_start(day: date, start: time, delta_minutes: int) -> tuple[time, date]:
+    dt = datetime.combine(day, start) + timedelta(minutes=int(delta_minutes))
+    return dt.time(), dt.date()
+
 
 # Adjacent venue pairs (bidirectional) – noise can bleed between these
 ADJACENT_VENUES: set[frozenset[str]] = {
@@ -40,14 +68,15 @@ class EventRequest:
     club_name: str
     event_name: str
     preferred_date: date
-    preferred_time_slot: str          # "morning" | "afternoon" | "evening"
-    preferred_venue: str              # one of VENUES
-    expected_audience_size: int
-    audience_tags: list[str]          # e.g. ["tech", "general", "first_year"]
-    budget_requested: int             # in rupees
-    flexibility: int                  # 1 (flexible) to 5 (rigid)
-    noise_level: str                  # "low" | "medium" | "high"
-    priority_score: float = 0.0       # higher -> deprioritised before, deserves turn
+    preferred_start: time             # e.g. 13:45 — user-selectable
+    duration_minutes: int = 90        # event length for overlap detection
+    preferred_venue: str = ""         # one of VENUES
+    expected_audience_size: int = 0
+    audience_tags: list[str] = field(default_factory=list)
+    budget_requested: int = 0
+    flexibility: int = 3
+    noise_level: str = "medium"
+    priority_score: float = 0.0
     preference_weights: PreferenceWeights = field(default_factory=PreferenceWeights)
 
 
@@ -57,9 +86,10 @@ class FairnessTracker:
         self.wins: dict[str, int] = {}
         self.prime_slots: dict[str, int] = {}
 
-    def record_win(self, club: str, venue: str, slot: str):
+    def record_win(self, club: str, venue: str, event_start: time):
         self.wins[club] = self.wins.get(club, 0) + 1
-        if slot == "evening" or venue == "Main Auditorium":
+        start_m = event_start.hour * 60 + event_start.minute
+        if venue == "Auditorium" or start_m >= 17 * 60:
             self.prime_slots[club] = self.prime_slots.get(club, 0) + 1
 
     def fairness_penalty(self, club: str) -> float:
@@ -94,7 +124,7 @@ class Resolution:
     loser: str
     resolution_type: str              # auto_swap | scored_decision | escalate | co_host_suggested
     new_venue: Optional[str]
-    new_time_slot: Optional[str]
+    new_start: Optional[time]         # new start time for loser when rescheduled
     new_date: Optional[date]
     explanation_data: dict
 
@@ -112,11 +142,6 @@ class SatisfactionResult:
 
 
 # ── Conflict Detection ───────────────────────────────────────────────────────
-
-def _slots_overlap(slot_a: str, slot_b: str) -> bool:
-    """Same slot counts as overlapping."""
-    return slot_a == slot_b
-
 
 def _tag_overlap_ratio(tags_a: list[str], tags_b: list[str]) -> float:
     if not tags_a or not tags_b:
@@ -137,8 +162,7 @@ def detect_conflicts(events: list[EventRequest]) -> list[Conflict]:
         # ── venue_clash ──────────────────────────────────────────────
         if (
             a.preferred_venue == b.preferred_venue
-            and a.preferred_date == b.preferred_date
-            and _slots_overlap(a.preferred_time_slot, b.preferred_time_slot)
+            and intervals_overlap_on_calendar(a, b)
         ):
             if a.flexibility == 5 and b.flexibility == 5:
                 severity = 0.9
@@ -152,28 +176,31 @@ def detect_conflicts(events: list[EventRequest]) -> list[Conflict]:
                 parties=[a.club_name, b.club_name],
                 description=(
                     f"Both '{a.event_name}' ({a.club_name}) and '{b.event_name}' ({b.club_name}) "
-                    f"want {a.preferred_venue} on {a.preferred_date} during {a.preferred_time_slot}."
+                    f"want {a.preferred_venue} on {a.preferred_date}; schedules overlap "
+                    f"({format_event_schedule(a.preferred_start, a.duration_minutes)} vs "
+                    f"{format_event_schedule(b.preferred_start, b.duration_minutes)})."
                 ),
             ))
 
         # ── audience_overlap ─────────────────────────────────────────
-        if a.preferred_date == b.preferred_date:
-            ratio = _tag_overlap_ratio(a.audience_tags, b.audience_tags)
-            if ratio > 0.6:
-                conflicts.append(Conflict(
-                    type="audience_overlap",
-                    severity=round(ratio, 3),
-                    parties=[a.club_name, b.club_name],
-                    description=(
-                        f"'{a.event_name}' and '{b.event_name}' share {ratio:.0%} audience tags "
-                        f"on {a.preferred_date}; attendees will be split."
-                    ),
-                ))
+        ratio = _tag_overlap_ratio(a.audience_tags, b.audience_tags)
+        if ratio > 0.6 and intervals_overlap_on_calendar(a, b):
+            conflicts.append(Conflict(
+                type="audience_overlap",
+                severity=round(ratio, 3),
+                parties=[a.club_name, b.club_name],
+                description=(
+                    f"'{a.event_name}' and '{b.event_name}' share {ratio:.0%} audience tags "
+                    f"with overlapping times on {a.preferred_date} "
+                    f"({format_event_schedule(a.preferred_start, a.duration_minutes)} vs "
+                    f"{format_event_schedule(b.preferred_start, b.duration_minutes)}); "
+                    f"attendees will be split."
+                ),
+            ))
 
         # ── noise_proximity ──────────────────────────────────────────
         if (
-            a.preferred_date == b.preferred_date
-            and _slots_overlap(a.preferred_time_slot, b.preferred_time_slot)
+            intervals_overlap_on_calendar(a, b)
             and frozenset({a.preferred_venue, b.preferred_venue}) in ADJACENT_VENUES
         ):
             noise_pair = {a.noise_level, b.noise_level}
@@ -186,15 +213,15 @@ def detect_conflicts(events: list[EventRequest]) -> list[Conflict]:
                         f"High-noise event '{a.event_name if a.noise_level == 'high' else b.event_name}' "
                         f"is adjacent to low-noise event "
                         f"'{b.event_name if a.noise_level == 'high' else a.event_name}' "
-                        f"at the same time on {a.preferred_date}."
+                        f"during {format_event_schedule(a.preferred_start, a.duration_minutes)} "
+                        f"on {a.preferred_date}."
                     ),
                 ))
 
         # ── fairness_imbalance ───────────────────────────────────────
         if (
-            a.preferred_date == b.preferred_date
-            and _slots_overlap(a.preferred_time_slot, b.preferred_time_slot)
-            and a.preferred_venue == b.preferred_venue
+            a.preferred_venue == b.preferred_venue
+            and intervals_overlap_on_calendar(a, b)
         ):
             if a.priority_score > 0 and b.priority_score > 0:
                 higher = max(a.priority_score, b.priority_score)
@@ -289,15 +316,9 @@ def claim_score(event: EventRequest, all_events: list[EventRequest]) -> dict:
 
 # ── Resolution Engine ────────────────────────────────────────────────────────
 
-def _next_available_slot(
-    current_slot: str,
-    current_date: date,
-) -> tuple[str, date]:
-    """Walk morning→afternoon→evening→next-day-morning."""
-    idx = TIME_SLOTS.index(current_slot)
-    if idx + 1 < len(TIME_SLOTS):
-        return TIME_SLOTS[idx + 1], current_date
-    return TIME_SLOTS[0], current_date + timedelta(days=1)
+def _bump_minutes_for_loser(loser: EventRequest) -> int:
+    """Push the loser's start forward enough to usually clear a same-venue overlap."""
+    return max(30, int(loser.duration_minutes))
 
 
 def _find_event(name: str, events: list[EventRequest]) -> EventRequest | None:
@@ -316,6 +337,7 @@ def _best_alternative_venue(exclude: str) -> str:
 
 def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resolution]:
     """Apply resolution strategy based on severity thresholds."""
+    reset_fairness()
     resolutions: list[Resolution] = []
 
     for c in conflicts:
@@ -335,11 +357,15 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
                 loser="All",
                 resolution_type="budget_split",
                 new_venue=None,
-                new_time_slot=None,
+                new_start=None,
                 new_date=None,
                 explanation_data={
-                    "allocations": allocations
-                }
+                    "allocations": allocations,
+                    "resolution_reason": (
+                        "Each club's share of the daily cap is proportional to their "
+                        "claim score relative to other clubs on that date."
+                    ),
+                },
             ))
             continue
 
@@ -378,8 +404,9 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
 
         # ── severity < 0.3 → auto_swap ──────────────────────────────
         if c.severity < 0.3:
-            new_slot, new_date = _next_available_slot(
-                loser.preferred_time_slot, loser.preferred_date,
+            bump = _bump_minutes_for_loser(loser)
+            new_start, new_date = _bump_start(
+                loser.preferred_date, loser.preferred_start, bump,
             )
             resolutions.append(Resolution(
                 conflict=c,
@@ -387,21 +414,24 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
                 loser=loser.club_name,
                 resolution_type="auto_swap",
                 new_venue=None,
-                new_time_slot=new_slot,
+                new_start=new_start,
                 new_date=new_date,
                 explanation_data={
                     "winner_breakdown": w_breakdown,
                     "loser_breakdown": l_breakdown,
-                    "moved_to_slot": new_slot,
+                    "moved_to_start": new_start.strftime("%H:%M"),
+                    "moved_duration_minutes": loser.duration_minutes,
                     "moved_to_date": str(new_date),
                 },
             ))
+            _register_fairness_win(winner)
 
         # ── 0.3 ≤ severity ≤ 0.7 → scored_decision ─────────────────
         elif c.severity <= 0.7:
             alt_venue = _best_alternative_venue(winner.preferred_venue)
-            new_slot, new_date = _next_available_slot(
-                loser.preferred_time_slot, loser.preferred_date,
+            bump = _bump_minutes_for_loser(loser)
+            new_start, new_date = _bump_start(
+                loser.preferred_date, loser.preferred_start, bump,
             )
             resolutions.append(Resolution(
                 conflict=c,
@@ -409,16 +439,18 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
                 loser=loser.club_name,
                 resolution_type="scored_decision",
                 new_venue=alt_venue,
-                new_time_slot=new_slot,
+                new_start=new_start,
                 new_date=new_date,
                 explanation_data={
                     "winner_breakdown": w_breakdown,
                     "loser_breakdown": l_breakdown,
                     "alternative_venue": alt_venue,
-                    "moved_to_slot": new_slot,
+                    "moved_to_start": new_start.strftime("%H:%M"),
+                    "moved_duration_minutes": loser.duration_minutes,
                     "moved_to_date": str(new_date),
                 },
             ))
+            _register_fairness_win(winner)
 
         # ── severity > 0.7 → escalate or co_host_suggested ──────────
         else:
@@ -434,7 +466,7 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
                 loser=loser.club_name,
                 resolution_type=res_type,
                 new_venue=None,
-                new_time_slot=None,
+                new_start=None,
                 new_date=None,
                 explanation_data={
                     "winner_breakdown": w_breakdown,
@@ -447,8 +479,46 @@ def resolve(conflicts: list[Conflict], events: list[EventRequest]) -> list[Resol
                     ),
                 },
             ))
+            _register_fairness_win(winner)
 
     return resolutions
+
+
+def _register_fairness_win(winner: EventRequest) -> None:
+    """Track wins so repeat winners get a claim-score penalty on later conflicts."""
+    _fairness.record_win(
+        winner.club_name,
+        winner.preferred_venue,
+        winner.preferred_start,
+    )
+
+
+def satisfaction_results_for_session(
+    events: list[EventRequest],
+    resolutions: list[Resolution],
+) -> list[SatisfactionResult]:
+    """
+    Per-club satisfaction using the same aggregation as the Streamlit UI:
+    first resolution where the club is winner or loser, plus budget allocation
+    when a budget cap resolution exists.
+    """
+    results: list[SatisfactionResult] = []
+    budget_res = next(
+        (r for r in resolutions if r.conflict.type == "budget_exceeded"),
+        None,
+    )
+    for event in events:
+        rel_res = next(
+            (r for r in resolutions if event.club_name in (r.winner, r.loser)),
+            None,
+        )
+        budget_alloc = None
+        if budget_res:
+            budget_alloc = (budget_res.explanation_data or {}).get("allocations", {}).get(
+                event.club_name
+            )
+        results.append(compute_satisfaction(event, rel_res, budget_alloc))
+    return results
 
 
 # ── Satisfaction & Fairness ──────────────────────────────────────────────────
@@ -470,12 +540,23 @@ def compute_satisfaction(
     else:
         # Loser: check what actually changed
         final_venue = resolution.new_venue or event.preferred_venue
-        final_slot  = resolution.new_time_slot or event.preferred_time_slot
-        final_date  = resolution.new_date or event.preferred_date
+        final_start = (
+            resolution.new_start
+            if resolution.new_start is not None
+            else event.preferred_start
+        )
+        final_date = resolution.new_date or event.preferred_date
 
         venue_score = 100.0 if final_venue == event.preferred_venue else 30.0
-        slot_score  = 100.0 if final_slot  == event.preferred_time_slot else 50.0
-        date_score  = 100.0 if final_date  == event.preferred_date else 40.0
+        slot_score = (
+            100.0
+            if (
+                final_date == event.preferred_date
+                and final_start == event.preferred_start
+            )
+            else 50.0
+        )
+        date_score = 100.0 if final_date == event.preferred_date else 40.0
 
     # Budget satisfaction
     alloc = budget_allocated if budget_allocated is not None else event.budget_requested
@@ -573,7 +654,8 @@ if __name__ == "__main__":
             club_name="CodeCraft",
             event_name="Hackathon 2026",
             preferred_date=date(2026, 4, 20),
-            preferred_time_slot="morning",
+            preferred_start=time(9, 0),
+            duration_minutes=120,
             preferred_venue="Auditorium",
             expected_audience_size=300,
             audience_tags=["tech", "competitive", "first_year"],
@@ -586,7 +668,8 @@ if __name__ == "__main__":
             club_name="LitSoc",
             event_name="Poetry Slam",
             preferred_date=date(2026, 4, 20),
-            preferred_time_slot="morning",
+            preferred_start=time(9, 30),
+            duration_minutes=90,
             preferred_venue="Auditorium",           # ← venue clash with CodeCraft
             expected_audience_size=80,
             audience_tags=["literature", "general"],
@@ -599,7 +682,8 @@ if __name__ == "__main__":
             club_name="Robotics",
             event_name="Bot Wars",
             preferred_date=date(2026, 4, 20),
-            preferred_time_slot="morning",
+            preferred_start=time(10, 0),
+            duration_minutes=180,
             preferred_venue="Seminar Hall",
             expected_audience_size=200,
             audience_tags=["tech", "competitive", "first_year"],  # heavy overlap with CodeCraft
@@ -612,7 +696,8 @@ if __name__ == "__main__":
             club_name="DebSoc",
             event_name="Inter-College Debate",
             preferred_date=date(2026, 4, 20),
-            preferred_time_slot="afternoon",
+            preferred_start=time(14, 0),
+            duration_minutes=120,
             preferred_venue="Seminar Hall",
             expected_audience_size=120,
             audience_tags=["general", "literature"],
@@ -651,8 +736,9 @@ if __name__ == "__main__":
         print(f"     loser     : {r.loser}")
         if r.new_venue:
             print(f"     new venue : {r.new_venue}")
-        if r.new_time_slot:
-            print(f"     new slot  : {r.new_time_slot}")
+        if r.new_start:
+            dur = (r.explanation_data or {}).get("moved_duration_minutes", 90)
+            print(f"     new start : {format_event_schedule(r.new_start, int(dur))}")
         if r.new_date:
             print(f"     new date  : {r.new_date}")
         print(f"     data      : {r.explanation_data}\n")

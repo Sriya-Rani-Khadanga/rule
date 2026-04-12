@@ -4,11 +4,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import datetime
-import time
+
 from logic import (
-    EventRequest, PreferenceWeights, Conflict, Resolution,
-    SatisfactionResult, detect_conflicts, resolve, reset_fairness,
-    compute_satisfaction, compute_system_fairness
+    EventRequest, PreferenceWeights, VENUES, format_event_schedule,
+    detect_conflicts, resolve, reset_fairness,
+    compute_system_fairness, satisfaction_results_for_session,
 )
 from explainer import validate_all, explain_resolution
 from demo_data import SCENARIOS
@@ -36,8 +36,13 @@ with left_col:
   st.subheader("Load a Demo Scenario")
   scenario_choice = st.selectbox(
       "Choose a pre-built scenario",
-      options=["— select —", "A: Simple venue clash", "B: Budget overrun + audience overlap", "C: All conflict types (stress test)"],
-      key="scenario_select"
+      options=[
+          "— select —",
+          "A: Simple venue clash (Auditorium, overlapping times)",
+          "B: Budget overrun + audience overlap",
+          "C: All conflict types (stress test, 5 clubs)",
+      ],
+      key="scenario_select",
   )
   if scenario_choice != "— select —":
       scenario_key = scenario_choice[0]  # "A", "B", or "C"
@@ -54,30 +59,41 @@ with left_col:
 
   st.subheader("Add Event Request")
 
-  with st.expander("✨ Describe your event in plain English (AI pre-fill)"):
-      plain_text = st.text_area(
-          "e.g. 'Drama club wants the big hall on Friday evening, budget around 8000, not very flexible'",
-          key="plain_text_input", height=80
-      )
-      if st.button("Parse with AI →", key="ai_parse_btn"):
-          st.info("AI parser: wire up ai_parser.py here. Form pre-fill goes into st.session_state.")
-
   with st.form("event_form", clear_on_submit=True):
       col1, col2 = st.columns(2)
       with col1:
           club_name   = st.text_input("Club Name *")
           event_name  = st.text_input("Event Name *")
           pref_date   = st.date_input("Event Date *", min_value=datetime.date.today())
-          time_slot   = st.selectbox("Time Slot", ["morning", "afternoon", "evening"])
+          start_time  = st.time_input(
+              "Start time *",
+              value=datetime.time(12, 0),
+              step=300,
+              help="Granularity 5 minutes. End time is start + duration.",
+          )
       with col2:
-          venue       = st.selectbox("Venue", ["Main Auditorium", "Open Amphitheatre", "Seminar Hall A", "Seminar Hall B", "Rooftop Terrace"])
+          venue       = st.selectbox("Venue", VENUES, help="Must match campus venues used by the engine.")
+          duration_m  = st.number_input(
+              "Duration (minutes) *",
+              min_value=15,
+              max_value=720,
+              value=90,
+              step=15,
+              help="Used for overlap detection (venue, audience, adjacent noise).",
+          )
           audience    = st.number_input("Expected Audience", min_value=1, max_value=5000, value=100)
           budget      = st.number_input("Budget Requested (₹)", min_value=1, value=5000)
           noise       = st.radio("Noise Level", ["low", "medium", "high"], horizontal=True)
 
       audience_tags = st.multiselect(
           "Audience Tags",
-          ["tech", "arts", "sports", "general", "first_year", "final_year"]
+          sorted(
+              {
+                  "tech", "arts", "sports", "general", "first_year", "final_year",
+                  "cultural", "literature", "competitive",
+              }
+          ),
+          help="Pick at least one for meaningful audience-overlap detection.",
       )
       flexibility = st.slider("Overall Flexibility (1=very flexible, 5=rigid)", 1, 5, 3)
       priority    = st.slider("Priority Score (0=always gets slots, 1=long deprived)", 0.0, 1.0, 0.0, step=0.1)
@@ -87,7 +103,7 @@ with left_col:
       with wcol1:
           w_venue = st.slider("Venue", 0.0, 1.0, 0.5, step=0.1, key="w_venue")
       with wcol2:
-          w_slot  = st.slider("Time Slot", 0.0, 1.0, 0.5, step=0.1, key="w_slot")
+          w_slot  = st.slider("Schedule / time importance", 0.0, 1.0, 0.5, step=0.1, key="w_slot")
       with wcol3:
           w_budget = st.slider("Budget", 0.0, 1.0, 0.5, step=0.1, key="w_budget")
 
@@ -96,7 +112,9 @@ with left_col:
       if submitted:
           raw = {
               "club_name": club_name, "event_name": event_name,
-              "preferred_date": pref_date, "preferred_time_slot": time_slot,
+              "preferred_date": pref_date,
+              "preferred_start": start_time,
+              "duration_minutes": int(duration_m),
               "preferred_venue": venue, "expected_audience_size": audience,
               "audience_tags": audience_tags, "budget_requested": budget,
               "flexibility": flexibility, "noise_level": noise,
@@ -127,7 +145,8 @@ with left_col:
       st.markdown(f"**{len(st.session_state['events'])} event(s) submitted**")
       table_data = [{
           "Club": e.club_name, "Event": e.event_name,
-          "Date": str(e.preferred_date), "Slot": e.preferred_time_slot,
+          "Date": str(e.preferred_date),
+          "Schedule": format_event_schedule(e.preferred_start, e.duration_minutes),
           "Venue": e.preferred_venue, "Audience": e.expected_audience_size,
           "Budget (₹)": f"₹{e.budget_requested:,}", "Flexibility": e.flexibility
       } for e in st.session_state["events"]]
@@ -138,7 +157,6 @@ with left_col:
           if st.button("🔍 Detect Conflicts & Resolve", type="primary",
                        use_container_width=True,
                        disabled=len(st.session_state["events"]) < 2):
-              reset_fairness()
               with st.spinner("Detecting conflicts..."):
                   time.sleep(0.8)
                   st.session_state["conflicts"] = detect_conflicts(st.session_state["events"])
@@ -149,21 +167,10 @@ with left_col:
                   )
               with st.spinner("Computing satisfaction scores..."):
                   time.sleep(0.5)
-                  sat_results = []
-                  for event in st.session_state["events"]:
-                      rel_res = next(
-                          (r for r in st.session_state["resolutions"]
-                           if event.club_name in [r.winner, r.loser]), None
-                      )
-                      budget_alloc = None
-                      budget_res = next(
-                          (r for r in st.session_state["resolutions"]
-                           if r.conflict.type == "budget_exceeded"), None
-                      )
-                      if budget_res:
-                          budget_alloc = budget_res.explanation_data.get(
-                              "allocations", {}).get(event.club_name)
-                      sat_results.append(compute_satisfaction(event, rel_res, budget_alloc))
+                  sat_results = satisfaction_results_for_session(
+                      st.session_state["events"],
+                      st.session_state["resolutions"],
+                  )
                   st.session_state["satisfaction"] = sat_results
                   st.session_state["fairness"] = compute_system_fairness(sat_results)
               st.rerun()
@@ -240,6 +247,8 @@ with right_col:
                   st.success(f"⚖️ Scored decision: {explanation}")
               elif r.resolution_type == "co_host_suggested":
                   st.info(f"🤝 Co-hosting suggested: {explanation}")
+              elif r.resolution_type == "budget_split":
+                  st.warning(f"💰 Budget cap: {explanation}")
               else:
                   st.error(f"⚠️ Escalated: {explanation}")
 
@@ -270,7 +279,8 @@ with right_col:
                               "Fairness adj": lb.get("deprivation_bonus", 0) + lb.get("fairness_penalty", 0),
                           })
                   elif "allocations" in data:
-                      st.write("Budget allocation breakdown:")
+                      st.write(data.get("resolution_reason", ""))
+                      st.write("Budget allocation breakdown (Rs.):")
                       st.json(data.get("allocations", {}))
                   else:
                       st.json(data)
@@ -292,6 +302,15 @@ with right_col:
                   )
               with col_b:
                   with st.expander("details"):
+                      ev = next(
+                          (e for e in st.session_state["events"] if e.club_name == s.club_name),
+                          None,
+                      )
+                      if ev:
+                          st.caption(
+                              "Preferred: "
+                              f"{format_event_schedule(ev.preferred_start, ev.duration_minutes)}"
+                          )
                       st.json(s.breakdown)
 
           st.divider()
